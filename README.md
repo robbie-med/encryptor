@@ -4,7 +4,7 @@ A lightweight, **client-side web app** that encrypts and decrypts code blocks us
 Everything runs **entirely in your browser** — no servers, no uploads, no telemetry.
 
 Perfect for safely sharing sensitive snippets in notes, GitHub issues, chat, or documentation.
-
+[[https://robbie-med.github.io/encryptor/]]
 ---
 
 ## ✨ Features
