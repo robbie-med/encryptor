@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Code Block Encryptor (Password)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; max-width: 980px; }
+    textarea, input { width: 100%; box-sizing: border-box; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    textarea { min-height: 220px; padding: 12px; }
+    input { padding: 10px; margin: 6px 0 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    button { padding: 10px 12px; cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin: 14px 0; }
+    .hint { color: #444; font-size: 13px; margin-top: 6px; }
+    .small { font-size: 12px; color: #555; }
+    .ok { color: #0a7; }
+    .err { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1>Code Block Encryptor</h1>
+  <p class="small">
+    Encrypt/decrypt a code block with a password (client-side only). Output is a single “bundle” you can paste elsewhere.
+  </p>
+
+  <div class="card">
+    <label for="password"><b>Password</b></label>
+    <input id="password" type="password" autocomplete="new-password" placeholder="Enter password" />
+
+    <div class="row">
+      <button id="encryptBtn">Encrypt →</button>
+      <button id="decryptBtn">← Decrypt</button>
+      <button id="copyBtn">Copy Output</button>
+      <button id="clearBtn">Clear</button>
+    </div>
+
+    <div id="status" class="hint"></div>
+    <div class="hint">
+      Tip: Use a long passphrase. If you forget it, there is no recovery.
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="input"><b>Input</b> (plaintext code or an encrypted bundle)</label>
+    <textarea id="input" placeholder="Paste code block here (plaintext) OR paste an encrypted bundle to decrypt..."></textarea>
+  </div>
+
+  <div class="card">
+    <label for="output"><b>Output</b></label>
+    <textarea id="output" placeholder="Encrypted bundle or decrypted plaintext will appear here..."></textarea>
+  </div>
+
+<script>
+/**
+ * Bundle format (JSON, then base64url):
+ * {
+ *   v: 1,
+ *   alg: "AES-GCM",
+ *   kdf: "PBKDF2",
+ *   iter: 200000,
+ *   hash: "SHA-256",
+ *   salt: base64url,
+ *   iv: base64url,
+ *   ct: base64url
+ * }
+ */
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+
+function setStatus(msg, kind="") {
+  statusEl.className = "hint " + (kind || "");
+  statusEl.textContent = msg;
+}
+
+function toUtf8Bytes(str) {
+  return new TextEncoder().encode(str);
+}
+function fromUtf8Bytes(bytes) {
+  return new TextDecoder().decode(bytes);
+}
+
+function b64urlEncode(bytes) {
+  const bin = Array.from(bytes, b => String.fromCharCode(b)).join("");
+  const b64 = btoa(bin);
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function b64urlDecode(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function randomBytes(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return a;
+}
+
+async function deriveAesKey(password, salt, iterations) {
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    toUtf8Bytes(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+function looksLikeBundle(text) {
+  // Accept either raw JSON or base64url(JSON)
+  const t = text.trim();
+  if (t.startsWith("{") && t.endsWith("}")) return true;
+  // base64url-ish
+  return /^[A-Za-z0-9\-_]+$/.test(t) && t.length > 40;
+}
+
+function parseBundle(text) {
+  const t = text.trim();
+  if (t.startsWith("{")) {
+    return JSON.parse(t);
+  }
+  // base64url -> json
+  const jsonBytes = b64urlDecode(t);
+  const jsonStr = fromUtf8Bytes(jsonBytes);
+  return JSON.parse(jsonStr);
+}
+
+function serializeBundle(obj, asBase64url=true) {
+  const json = JSON.stringify(obj);
+  if (!asBase64url) return json;
+  return b64urlEncode(toUtf8Bytes(json));
+}
+
+async function encryptText(plaintext, password) {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12); // recommended for GCM
+  const iter = 200000;
+
+  const key = await deriveAesKey(password, salt, iter);
+  const ctBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    toUtf8Bytes(plaintext)
+  );
+
+  const bundle = {
+    v: 1,
+    alg: "AES-GCM",
+    kdf: "PBKDF2",
+    iter,
+    hash: "SHA-256",
+    salt: b64urlEncode(salt),
+    iv: b64urlEncode(iv),
+    ct: b64urlEncode(new Uint8Array(ctBuf))
+  };
+
+  return serializeBundle(bundle, true);
+}
+
+async function decryptBundle(bundleText, password) {
+  const b = parseBundle(bundleText);
+
+  if (!b || b.v !== 1 || b.alg !== "AES-GCM" || b.kdf !== "PBKDF2") {
+    throw new Error("Unrecognized bundle format.");
+  }
+
+  const salt = b64urlDecode(b.salt);
+  const iv = b64urlDecode(b.iv);
+  const ct = b64urlDecode(b.ct);
+  const iter = Number(b.iter);
+
+  const key = await deriveAesKey(password, salt, iter);
+  const ptBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    key,
+    ct
+  );
+  return fromUtf8Bytes(new Uint8Array(ptBuf));
+}
+
+$("encryptBtn").addEventListener("click", async () => {
+  try {
+    const password = $("password").value;
+    const input = $("input").value;
+
+    if (!password) return setStatus("Enter a password first.", "err");
+    if (!input.trim()) return setStatus("Paste some plaintext code to encrypt.", "err");
+    if (looksLikeBundle(input)) {
+      setStatus("Input looks like an encrypted bundle. If you meant to encrypt plaintext, paste plaintext instead.", "err");
+      return;
+    }
+
+    setStatus("Encrypting...");
+    const out = await encryptText(input, password);
+    $("output").value = out;
+    setStatus("Encrypted. Copy the output bundle wherever you want.", "ok");
+  } catch (e) {
+    setStatus("Encrypt failed: " + (e?.message || e), "err");
+  }
+});
+
+$("decryptBtn").addEventListener("click", async () => {
+  try {
+    const password = $("password").value;
+    const input = $("input").value;
+
+    if (!password) return setStatus("Enter a password first.", "err");
+    if (!input.trim()) return setStatus("Paste an encrypted bundle to decrypt.", "err");
+    if (!looksLikeBundle(input)) {
+      setStatus("Input does not look like an encrypted bundle.", "err");
+      return;
+    }
+
+    setStatus("Decrypting...");
+    const out = await decryptBundle(input, password);
+    $("output").value = out;
+    setStatus("Decrypted.", "ok");
+  } catch (e) {
+    // AES-GCM will throw on wrong password or tampered ciphertext
+    setStatus("Decrypt failed (wrong password or corrupted bundle).", "err");
+  }
+});
+
+$("copyBtn").addEventListener("click", async () => {
+  try {
+    const text = $("output").value;
+    if (!text.trim()) return setStatus("Nothing to copy yet.", "err");
+    await navigator.clipboard.writeText(text);
+    setStatus("Copied output to clipboard.", "ok");
+  } catch {
+    setStatus("Copy failed. You may need to manually select + copy.", "err");
+  }
+});
+
+$("clearBtn").addEventListener("click", () => {
+  $("input").value = "";
+  $("output").value = "";
+  setStatus("");
+});
+</script>
+</body>
+</html>
